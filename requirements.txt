@@ -10,3 +10,4 @@ geopy
 folium
 streamlit-folium
 pytz
+tzdata
