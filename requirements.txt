@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+matplotlib
+scikit-learn
+scipy
+requests
+gridstatus
+geopy
+folium
+streamlit-folium
