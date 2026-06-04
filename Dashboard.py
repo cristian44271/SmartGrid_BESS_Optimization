@@ -13,6 +13,8 @@ import datetime
 from geopy.geocoders import Nominatim
 import folium
 from streamlit_folium import st_folium
+import os
+import glob
 
 # ============================================================
 # SESSION STATE INITIALIZATION
@@ -47,82 +49,66 @@ def on_load_click():
 # 1. DATA LOADING
 # ============================================================
 @st.cache_data
-def load_and_align_data(uploaded_bytes=None, lat=44.56, lon=-123.26, 
-                        sim_start_str='2026-04-17 00:00:00', sim_end_str='2026-06-02 23:45:00'):
-    # KEC load (or user-uploaded load)
+def load_and_align_data(uploaded_bytes=None, dataset_path=None, lat=44.56, lon=-123.26):
+    # Load user-uploaded load or sample dataset
     if uploaded_bytes is not None:
         raw_df = pd.read_csv(uploaded_bytes)
-        raw_df['clean_time'] = raw_df.iloc[:, 0].astype(str).str.split(' GMT').str[0]
-        raw_df['Time'] = pd.to_datetime(raw_df['clean_time'],
-                                        format='%a %b %d %Y %H:%M:%S',
-                                        errors='coerce')
-        mask_nat = raw_df['Time'].isna()
-        if mask_nat.any():
-            raw_df.loc[mask_nat, 'Time'] = pd.to_datetime(
-                raw_df.loc[mask_nat].iloc[:, 0], errors='coerce')
-        raw_df['Load_kWh'] = pd.to_numeric(raw_df.iloc[:, 1], errors='coerce').fillna(0)
-        raw_df['Load_kW'] = raw_df['Load_kWh'] * 4
-        raw_df = raw_df.dropna(subset=['Time']).set_index('Time').sort_index()
+    elif dataset_path is not None:
+        raw_df = pd.read_csv(dataset_path)
     else:
-        raw_df = pd.read_csv('Kelley Engineering Center Net Energy Usage (kWh).csv')
-        raw_df['clean_time'] = raw_df.iloc[:, 0].astype(str).str.split(' GMT').str[0]
-        raw_df['Time'] = pd.to_datetime(raw_df['clean_time'],
-                                        format='%a %b %d %Y %H:%M:%S')
-        raw_df['Load_kWh'] = pd.to_numeric(raw_df.iloc[:, 1], errors='coerce').fillna(0)
-        raw_df['Load_kW'] = raw_df['Load_kWh'] * 4
-        raw_df = raw_df.set_index('Time').sort_index()
+        # Fallback if somehow neither is provided
+        raw_df = pd.read_csv('datasets/Kelley Engineering Center Net Energy Usage (kWh).csv')
+
+    raw_df['clean_time'] = raw_df.iloc[:, 0].astype(str).str.split(' GMT').str[0]
+    raw_df['Time'] = pd.to_datetime(raw_df['clean_time'],
+                                    format='%a %b %d %Y %H:%M:%S',
+                                    errors='coerce')
+    mask_nat = raw_df['Time'].isna()
+    if mask_nat.any():
+        raw_df.loc[mask_nat, 'Time'] = pd.to_datetime(
+            raw_df.loc[mask_nat].iloc[:, 0], errors='coerce')
+    raw_df['Load_kWh'] = pd.to_numeric(raw_df.iloc[:, 1], errors='coerce').fillna(0)
+    raw_df['Load_kW'] = raw_df['Load_kWh'] * 4
+    raw_df = raw_df.dropna(subset=['Time']).set_index('Time').sort_index()
 
     # Solar & price
-    if uploaded_bytes is not None:
-        d_start = raw_df.index.min().strftime('%Y-%m-%d')
-        d_end = raw_df.index.max().strftime('%Y-%m-%d')
-        
-        # 1. Fetch Solar
-        url = f"https://archive-api.open-meteo.com/v1/archive?latitude={lat}&longitude={lon}&start_date={d_start}&end_date={d_end}&hourly=shortwave_radiation&timezone=America%2FLos_Angeles"
-        resp = requests.get(url)
-        if resp.status_code == 200:
-            data = resp.json()
+    d_start = raw_df.index.min().strftime('%Y-%m-%d')
+    d_end = raw_df.index.max().strftime('%Y-%m-%d')
+    
+    # 1. Fetch Solar
+    url = f"https://archive-api.open-meteo.com/v1/archive?latitude={lat}&longitude={lon}&start_date={d_start}&end_date={d_end}&hourly=shortwave_radiation&timezone=America%2FLos_Angeles"
+    resp = requests.get(url)
+    if resp.status_code == 200:
+        data = resp.json()
+        solar_df = pd.DataFrame({
+            'Time': pd.to_datetime(data['hourly']['time']),
+            'GHI_Wm2': data['hourly']['shortwave_radiation']
+        }).set_index('Time').sort_index()
+    else:
+        url_f = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&start_date={d_start}&end_date={d_end}&hourly=shortwave_radiation&timezone=America%2FLos_Angeles"
+        resp_f = requests.get(url_f)
+        if resp_f.status_code == 200:
+            data_f = resp_f.json()
             solar_df = pd.DataFrame({
-                'Time': pd.to_datetime(data['hourly']['time']),
-                'GHI_Wm2': data['hourly']['shortwave_radiation']
+                'Time': pd.to_datetime(data_f['hourly']['time']),
+                'GHI_Wm2': data_f['hourly']['shortwave_radiation']
             }).set_index('Time').sort_index()
         else:
-            url_f = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&start_date={d_start}&end_date={d_end}&hourly=shortwave_radiation&timezone=America%2FLos_Angeles"
-            resp_f = requests.get(url_f)
-            if resp_f.status_code == 200:
-                data_f = resp_f.json()
-                solar_df = pd.DataFrame({
-                    'Time': pd.to_datetime(data_f['hourly']['time']),
-                    'GHI_Wm2': data_f['hourly']['shortwave_radiation']
-                }).set_index('Time').sort_index()
-            else:
-                solar_df = pd.DataFrame()
+            solar_df = pd.DataFrame()
 
-        # 2. Fetch CAISO
-        iso = gridstatus.CAISO()
-        end_iso = (raw_df.index.max() + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-        try:
-            price_raw = iso.get_lmp(date=d_start, end=end_iso, market="DAY_AHEAD_HOURLY", locations=["TH_NP15_GEN-APND"])
-            price_raw['Time'] = pd.to_datetime(price_raw['Time']).dt.tz_localize(None)
-            price_raw['Price_USD_per_kWh'] = price_raw['LMP'] / 1000.0
-            price_df = price_raw.set_index('Time').sort_index()
-        except Exception:
-            price_df = pd.DataFrame()
-    else:
-        solar_df = pd.read_csv('solar_corvallis_2026.csv')
-        solar_df['Time'] = pd.to_datetime(solar_df['Timestamp_PDT'])
-        solar_df = solar_df.set_index('Time').sort_index()
+    # 2. Fetch CAISO
+    iso = gridstatus.CAISO()
+    end_iso = (raw_df.index.max() + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    try:
+        price_raw = iso.get_lmp(date=d_start, end=end_iso, market="DAY_AHEAD_HOURLY", locations=["TH_NP15_GEN-APND"])
+        price_raw['Time'] = pd.to_datetime(price_raw['Time']).dt.tz_localize(None)
+        price_raw['Price_USD_per_kWh'] = price_raw['LMP'] / 1000.0
+        price_df = price_raw.set_index('Time').sort_index()
+    except Exception:
+        price_df = pd.DataFrame()
 
-        price_df = pd.read_csv('electricity_prices_2026.csv')
-        price_df['Time'] = pd.to_datetime(price_df['Timestamp_PDT'])
-        price_df = price_df.set_index('Time').sort_index()
-
-    if uploaded_bytes is not None:
-        sim_start = raw_df.index.min()
-        sim_end = raw_df.index.max()
-    else:
-        sim_start = pd.Timestamp(sim_start_str)
-        sim_end   = pd.Timestamp(sim_end_str)
+    sim_start = raw_df.index.min()
+    sim_end = raw_df.index.max()
 
     time_grid = pd.date_range(start=sim_start, end=sim_end, freq='15min')
     df = pd.DataFrame(index=time_grid)
@@ -337,11 +323,22 @@ def calc_cost_breakdown(load_series, price_series, dt_hours, demand_charge_per_m
 # ============================================================
 st.sidebar.header("📂 0. Data Source")
 uploaded_file = st.sidebar.file_uploader(
-    " Upload Building Load CSV (Time|Energy Usage (kWh)))",
+    "Upload Custom Load CSV (Optional)",
      type=["csv"],
-    help="Two columns: Timestamp (col 1) and Load in kWh per 15 min (col 2). "
-         "If left empty, the default KEC data is used."
+    help="Two columns: Timestamp (col 1) and Load in kWh per 15 min (col 2)."
 )
+
+sample_files = glob.glob("datasets/*.csv")
+sample_options = [os.path.basename(f) for f in sample_files]
+default_idx = 0
+for i, f in enumerate(sample_options):
+    if "Kelley" in f:
+        default_idx = i
+
+if len(sample_options) > 0:
+    selected_sample = st.sidebar.selectbox("Or choose a Sample Dataset from GitHub:", options=sample_options, index=default_idx)
+else:
+    selected_sample = None
 
 st.sidebar.markdown("---")
 st.sidebar.header("📍 1. Location (For Solar API)")
@@ -380,9 +377,12 @@ st.sidebar.button("📥 Load Data Source", type="primary", on_click=on_load_clic
 # LOAD DATA TRIGGER
 if st.session_state.data_loaded:
     with st.spinner("Loading and aligning data..."):
-        uploaded_bytes = uploaded_file if uploaded_file is not None else None
         try:
-            df_ml = load_and_align_data(uploaded_bytes=uploaded_bytes, lat=user_lat, lon=user_lon)
+            if uploaded_file is not None:
+                df_ml = load_and_align_data(uploaded_bytes=uploaded_file, dataset_path=None, lat=user_lat, lon=user_lon)
+            else:
+                d_path = os.path.join("datasets", selected_sample) if selected_sample else None
+                df_ml = load_and_align_data(uploaded_bytes=None, dataset_path=d_path, lat=user_lat, lon=user_lon)
             if not df_ml.empty:
                 st.session_state.data_valid = True
                 data_min = df_ml.index.min().date()
